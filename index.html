@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Radiant Energy - WebGL Effect v5</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #AF2E22;
+        }
+        
+        #canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js"
+        }
+    }
+    </script>
+    
+    <script type="module">
+        import * as THREE from 'three';
+
+        // Color tokens from spec
+        const COLORS = {
+            core0: new THREE.Color('#FAF9E1'),
+            core1: new THREE.Color('#F7E7B3'),
+            core2: new THREE.Color('#F0C580'),
+            mid0: new THREE.Color('#E9A560'),
+            mid1: new THREE.Color('#E59353'),
+            bg0: new THREE.Color('#DF7F47'),
+            bg1: new THREE.Color('#DA6C3C'),
+            bg2: new THREE.Color('#AF2E22')
+        };
+
+        // Vertex shader for fullscreen quad
+        const vertexShader = `
+            varying vec2 vUv;
+            void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `;
+
+        // Main fragment shader
+        const fragmentShader = `
+            precision highp float;
+            
+            varying vec2 vUv;
+            
+            uniform float uTime;
+            uniform float uAspect;
+            uniform vec2 uResolution;
+            uniform vec2 uMouse;
+            uniform vec2 uMouseVelocity;
+            uniform bool uReducedMotion;
+            
+            // Color uniforms
+            uniform vec3 uCore0;
+            uniform vec3 uCore1;
+            uniform vec3 uCore2;
+            uniform vec3 uMid0;
+            uniform vec3 uMid1;
+            uniform vec3 uBg0;
+            uniform vec3 uBg1;
+            uniform vec3 uBg2;
+            
+            // Distortion field texture (computed on CPU)
+            uniform float uGlobalDistortion;
+            
+            // Mouse interaction history for distortion
+            #define MAX_TOUCHES 30
+            uniform vec2 uTouchPositions[MAX_TOUCHES];
+            uniform float uTouchTimes[MAX_TOUCHES];
+            uniform float uTouchStrengths[MAX_TOUCHES];
+            uniform int uTouchCount;
+            
+            // Simplex noise functions
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec3 permute(vec3 x) { return mod289(((x*34.0)+1.0)*x); }
+            
+            float snoise(vec2 v) {
+                const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                                   -0.577350269189626, 0.024390243902439);
+                vec2 i  = floor(v + dot(v, C.yy));
+                vec2 x0 = v - i + dot(i, C.xx);
+                vec2 i1;
+                i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+                vec4 x12 = x0.xyxy + C.xxzz;
+                x12.xy -= i1;
+                i = mod289(i);
+                vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0))
+                    + i.x + vec3(0.0, i1.x, 1.0));
+                vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy),
+                    dot(x12.zw,x12.zw)), 0.0);
+                m = m*m;
+                m = m*m;
+                vec3 x = 2.0 * fract(p * C.www) - 1.0;
+                vec3 h = abs(x) - 0.5;
+                vec3 ox = floor(x + 0.5);
+                vec3 a0 = x - ox;
+                m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+                vec3 g;
+                g.x  = a0.x  * x0.x  + h.x  * x0.y;
+                g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+                return 130.0 * dot(m, g);
+            }
+            
+            // FBM for organic distortion - gentler version
+            float fbm(vec2 p) {
+                float f = 0.0;
+                float w = 0.5;
+                for (int i = 0; i < 3; i++) {
+                    f += w * snoise(p);
+                    p *= 1.8;
+                    w *= 0.5;
+                }
+                return f;
+            }
+            
+            // Hash function for randomness
+            float hash(float n) {
+                return fract(sin(n) * 43758.5453123);
+            }
+            
+            vec2 hash2(float n) {
+                return vec2(hash(n), hash(n + 7.13));
+            }
+            
+            // Calculate mouse/touch distortion field - now affects entire screen
+            vec2 getDistortion(vec2 uv, float time) {
+                vec2 distortion = vec2(0.0);
+                
+                for (int i = 0; i < MAX_TOUCHES; i++) {
+                    if (i >= uTouchCount) break;
+                    
+                    vec2 touchUV = uTouchPositions[i] - 0.5;
+                    touchUV.x *= uAspect;
+                    
+                    float age = time - uTouchTimes[i];
+                    float strength = uTouchStrengths[i];
+                    
+                    // Much slower decay for longer-lasting effect
+                    float decay = exp(-age * 0.15) * strength;
+                    
+                    vec2 diff = uv - touchUV;
+                    float dist = length(diff);
+                    
+                    // Wider influence radius
+                    vec2 dir = normalize(diff + 0.001);
+                    
+                    // Ripple that expands outward over time
+                    float rippleRadius = age * 0.12;
+                    float rippleWidth = 0.15 + age * 0.05;
+                    float ripple = sin((dist - rippleRadius) * 15.0) * exp(-abs(dist - rippleRadius) / rippleWidth);
+                    
+                    // Combine push-out and ripple
+                    float falloff = exp(-dist * 1.5);
+                    distortion += dir * decay * (falloff * 0.2 + ripple * 0.08);
+                }
+                
+                // Global distortion wave that persists
+                distortion += vec2(
+                    snoise(uv * 2.0 + time * 0.05) * uGlobalDistortion,
+                    snoise(uv * 2.0 + 100.0 + time * 0.05) * uGlobalDistortion
+                ) * 0.03;
+                
+                // Current mouse position continuous distortion
+                vec2 mouseUV = uMouse - 0.5;
+                mouseUV.x *= uAspect;
+                vec2 diff = uv - mouseUV;
+                float dist = length(diff);
+                vec2 dir = normalize(diff + 0.001);
+                float mouseFalloff = exp(-dist * 2.0);
+                distortion += dir * length(uMouseVelocity) * mouseFalloff * 0.5;
+                
+                return distortion;
+            }
+            
+            // Concentric elliptical topographic lines expanding outward
+            float topoLines(vec2 uv, float time, vec2 distortion, out float distFromCenter) {
+                // Apply distortion to UV
+                vec2 distortedUV = uv + distortion;
+                
+                // Elliptical distance from center
+                vec2 ellipseScale = vec2(1.0, 1.3);
+                float dist = length(distortedUV * ellipseScale);
+                distFromCenter = dist;
+                
+                // Add organic noise - GENTLER, slower variation
+                float noiseScale = 2.5; // Lower frequency for gentler waves
+                float noise = fbm(distortedUV * noiseScale + vec2(0.0, time * 0.008)) * 0.05;
+                noise += fbm(distortedUV * noiseScale * 0.4 + vec2(time * 0.004, 0.0)) * 0.03;
+                
+                float distWithNoise = dist + noise;
+                
+                // Outward expanding animation
+                float expansion = uReducedMotion ? 0.0 : time * 0.0125;
+                distWithNoise -= expansion;
+                
+                // Variable line spacing: denser at center (0.5x), sparser at edge (1.25x)
+                // Interpolate spacing based on distance
+                float normalizedDist = clamp(dist / 0.8, 0.0, 1.0);
+                float spacingMultiplier = mix(0.5, 1.2, normalizedDist);
+                float baseSpacing = 0.02;
+                float lineSpacing = baseSpacing * spacingMultiplier;
+                
+                // For variable spacing, we need to integrate
+                // Simple approximation: use current spacing
+                float linePhase = mod(distWithNoise, lineSpacing) / lineSpacing;
+                
+                // Line width - 0.8x of previous (0.15 * 0.8 = 0.12)
+                float lineWidth = 0.12;
+                float line = smoothstep(0.0, lineWidth, linePhase) * smoothstep(lineWidth * 2.0, lineWidth, linePhase);
+                
+                // Fade out near center
+                float centerFade = smoothstep(0.03, 0.15, dist);
+                // Fade out at far edges
+                float edgeFade = smoothstep(1.3, 0.5, dist);
+                
+                return line * centerFade * edgeFade;
+            }
+            
+            // Multiple glow points for more organic/random central glow
+            vec3 multiPointGlow(vec2 uv, float time) {
+                vec3 totalGlow = vec3(0.0);
+                
+                // Number of glow points
+                const int NUM_POINTS = 7;
+                
+                float pulseSpeed = uReducedMotion ? 0.0 : 1.0;
+                
+                // Intensity divided by number of points to maintain same total brightness
+                float intensityScale = 1.0 / float(NUM_POINTS);
+                
+                for (int i = 0; i < NUM_POINTS; i++) {
+                    float fi = float(i);
+                    
+                    // Random offset from center (very small range)
+                    float offsetRange = 0.025;
+                    vec2 offset = vec2(
+                        sin(time * (0.3 + fi * 0.17) + fi * 2.7) * offsetRange * (0.5 + hash(fi) * 0.5),
+                        cos(time * (0.25 + fi * 0.13) + fi * 3.1) * offsetRange * (0.5 + hash(fi + 10.0) * 0.5)
+                    );
+                    
+                    if (uReducedMotion) offset *= 0.0;
+                    
+                    vec2 pointPos = offset;
+                    float dist = length(uv - pointPos);
+                    
+                    // Varying sizes for each point
+                    float sizeVar = 0.4 + hash(fi + 5.0) * 0.6;
+                    float brightVar = 0.5 + hash(fi + 20.0) * 0.5;
+                    
+                    // Individual pulse phase
+                    float pulse = 1.0 + sin(time * (0.6 + fi * 0.12) * pulseSpeed + fi * 1.5) * 0.08;
+                    
+                    // Smaller core size
+                    float coreSize = 0.004 * sizeVar * pulse;
+                    float innerSize = 0.025 * sizeVar * pulse;
+                    float outerSize = 0.08 * sizeVar * pulse;
+                    
+                    // Core (white hot) - intensity scaled down
+                    float coreGlow = exp(-dist * dist / coreSize) * 0.6 * brightVar * intensityScale;
+                    
+                    // Inner bloom (yellow) - intensity scaled down
+                    float innerBloom = exp(-dist * dist / innerSize) * 0.4 * brightVar * intensityScale;
+                    
+                    // Outer bloom (orange) - intensity scaled down
+                    float outerBloom = exp(-dist * dist / outerSize) * 0.25 * brightVar * intensityScale;
+                    
+                    totalGlow += uCore0 * coreGlow;
+                    totalGlow += uCore1 * innerBloom;
+                    totalGlow += uCore2 * outerBloom;
+                }
+                
+                // Add a wider shared halo (not multiplied by intensityScale as it's shared)
+                float dist = length(uv);
+                float pulse = 1.0 + sin(time * 0.5 * pulseSpeed) * 0.04;
+                float halo = exp(-dist * dist / (0.25 * pulse)) * 0.15;
+                totalGlow += uMid0 * halo;
+                
+                return totalGlow;
+            }
+            
+            // Lens flare / anamorphic streak calculation - TRIPLED intensity
+            float lensFlare(vec2 uv, float time) {
+                float flare = 0.0;
+                
+                // Distance from center
+                float dist = length(uv);
+                
+                // Anamorphic horizontal streak - 3x intensity
+                float horizontalStreak = exp(-abs(uv.y) * 18.0) * exp(-dist * 1.8) * 3.0;
+                
+                // Multiple ray angles from diffraction
+                float numRays = 16.0;
+                for (float i = 0.0; i < 16.0; i++) {
+                    float angle = i * 3.14159265 * 2.0 / numRays;
+                    
+                    // Add slight variation to angles
+                    float angleVar = sin(i * 7.13) * 0.12;
+                    angle += angleVar;
+                    
+                    // Animated wobble
+                    float wobble = uReducedMotion ? 0.0 : sin(time * (0.5 + i * 0.06) + i * 1.7) * 0.025;
+                    angle += wobble;
+                    
+                    vec2 rayDir = vec2(cos(angle), sin(angle));
+                    
+                    // Project UV onto ray direction
+                    float along = dot(uv, rayDir);
+                    float across = abs(dot(uv, vec2(-rayDir.y, rayDir.x)));
+                    
+                    // Only positive direction from center
+                    if (along > 0.0) {
+                        // Diffraction pattern - 3x intensity
+                        float intensity = exp(-across * 45.0) * exp(-along * 2.2) * 3.0;
+                        
+                        // Brightness variation per ray
+                        float brightVar = 0.5 + sin(i * 5.3) * 0.5;
+                        
+                        // Animated intensity
+                        float pulseVar = uReducedMotion ? 1.0 : 1.0 + sin(time * (1.0 + i * 0.12) + i * 2.1) * 0.18;
+                        
+                        flare += intensity * brightVar * pulseVar;
+                    }
+                }
+                
+                // Add the horizontal anamorphic component
+                flare += horizontalStreak * 0.4;
+                
+                // Central starburst - 3x intensity
+                float starburst = 0.0;
+                for (float i = 0.0; i < 8.0; i++) {
+                    float angle = i * 3.14159265 / 4.0;
+                    vec2 rayDir = vec2(cos(angle), sin(angle));
+                    float across = abs(dot(uv, vec2(-rayDir.y, rayDir.x)));
+                    starburst += exp(-across * 90.0) * exp(-dist * 10.0) * 3.0;
+                }
+                flare += starburst * 0.25;
+                
+                return flare;
+            }
+            
+            // Screen blend mode
+            vec3 screenBlend(vec3 base, vec3 blend) {
+                return 1.0 - (1.0 - base) * (1.0 - blend);
+            }
+            
+            // Add blend mode
+            vec3 addBlend(vec3 base, vec3 blend) {
+                return min(base + blend, vec3(1.0));
+            }
+            
+            void main() {
+                // Aspect-corrected UV centered at origin
+                vec2 uv = vUv - 0.5;
+                uv.x *= uAspect;
+                
+                float dist = length(uv);
+                float time = uTime;
+                
+                // === Background Gradient ===
+                vec3 bgColor = mix(uMid0, uBg2, smoothstep(0.0, 0.8, dist));
+                
+                // Add linear gradient overlay
+                float linearGrad = (vUv.x + vUv.y) * 0.5;
+                vec3 linearOverlay = mix(uBg0, uBg2, linearGrad);
+                bgColor = mix(bgColor, linearOverlay, 0.3);
+                
+                // Vignette
+                float vignette = 1.0 - smoothstep(0.3, 0.9, dist);
+                bgColor *= 0.85 + vignette * 0.15;
+                
+                // === Topographic Lines with Mouse Distortion ===
+                vec2 distortion = getDistortion(uv, time);
+                float topoDistFromCenter;
+                float topo = topoLines(uv, time, distortion, topoDistFromCenter);
+                
+                // Topo line color and blend
+                // Opacity varies: 0.24 at center, 0.12 at edge
+                float normalizedDist = clamp(topoDistFromCenter / 0.8, 0.0, 1.0);
+                float topoBaseOpacity = mix(0.24, 0.12, normalizedDist);
+                
+                vec3 topoColor = mix(uCore2, uMid0, 0.4);
+                float topoOpacity = topo * topoBaseOpacity;
+                
+                // Fade topo near bright center
+                float topoFade = smoothstep(0.06, 0.2, topoDistFromCenter);
+                topoOpacity *= topoFade;
+                
+                bgColor = mix(bgColor, screenBlend(bgColor, topoColor), topoOpacity);
+                
+                // === Multi-point Central Glow ===
+                vec3 glowColor = multiPointGlow(uv, time);
+                
+                // === Lens Flare Rays ===
+                float flare = lensFlare(uv, time);
+                
+                // Color gradient for flare
+                vec3 flareColor = mix(uCore0, uCore1, smoothstep(0.0, 0.15, dist));
+                flareColor = mix(flareColor, uCore2, smoothstep(0.15, 0.4, dist));
+                
+                // Flare intensity - increased base
+                float avgGlow = (glowColor.r + glowColor.g + glowColor.b) / 3.0;
+                float flareIntensity = flare * (0.5 + avgGlow * 0.3);
+                
+                // === Additive Haze ===
+                float haze = exp(-dist * dist / 0.3) * 0.06;
+                vec3 hazeColor = mix(uCore1, uMid0, dist * 2.0) * haze;
+                
+                // === Film Grain ===
+                float grainTime = uReducedMotion ? 0.0 : floor(time * 24.0);
+                float grain = snoise(vUv * uResolution * 0.5 + grainTime * 100.0) * 0.02;
+                
+                // === Composite ===
+                vec3 finalColor = bgColor;
+                
+                // Add glow (additive)
+                finalColor = addBlend(finalColor, glowColor);
+                
+                // Add lens flare (screen blend)
+                finalColor = screenBlend(finalColor, flareColor * flareIntensity);
+                
+                // Add haze
+                finalColor = addBlend(finalColor, hazeColor);
+                
+                // Add grain
+                finalColor += grain;
+                
+                // Final vignette
+                float finalVignette = 1.0 - smoothstep(0.5, 1.0, dist * 0.8);
+                finalColor *= 0.9 + finalVignette * 0.1;
+                
+                // Soft tone mapping
+                finalColor = finalColor / (finalColor + 0.55) * 1.55;
+                
+                gl_FragColor = vec4(finalColor, 1.0);
+            }
+        `;
+
+        class RadiantEnergy {
+            constructor() {
+                this.canvas = document.getElementById('canvas');
+                this.touches = [];
+                this.maxTouches = 30;
+                this.mousePos = new THREE.Vector2(0.5, 0.5);
+                this.prevMousePos = new THREE.Vector2(0.5, 0.5);
+                this.mouseVelocity = new THREE.Vector2(0, 0);
+                this.globalDistortion = 0.0;
+                this.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                
+                this.init();
+                this.setupEvents();
+                this.animate();
+            }
+            
+            init() {
+                // Renderer
+                this.renderer = new THREE.WebGLRenderer({
+                    canvas: this.canvas,
+                    antialias: true,
+                    alpha: false
+                });
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                
+                // Scene & Camera
+                this.scene = new THREE.Scene();
+                this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+                this.camera.position.z = 1;
+                
+                // Uniforms
+                this.uniforms = {
+                    uTime: { value: 0 },
+                    uAspect: { value: window.innerWidth / window.innerHeight },
+                    uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+                    uMouse: { value: new THREE.Vector2(0.5, 0.5) },
+                    uMouseVelocity: { value: new THREE.Vector2(0, 0) },
+                    uReducedMotion: { value: this.reducedMotion },
+                    uGlobalDistortion: { value: 0.0 },
+                    
+                    // Colors
+                    uCore0: { value: COLORS.core0 },
+                    uCore1: { value: COLORS.core1 },
+                    uCore2: { value: COLORS.core2 },
+                    uMid0: { value: COLORS.mid0 },
+                    uMid1: { value: COLORS.mid1 },
+                    uBg0: { value: COLORS.bg0 },
+                    uBg1: { value: COLORS.bg1 },
+                    uBg2: { value: COLORS.bg2 },
+                    
+                    // Touch/mouse interaction points
+                    uTouchPositions: { value: new Array(30).fill(null).map(() => new THREE.Vector2(0, 0)) },
+                    uTouchTimes: { value: new Float32Array(30) },
+                    uTouchStrengths: { value: new Float32Array(30) },
+                    uTouchCount: { value: 0 }
+                };
+                
+                // Fullscreen quad
+                const geometry = new THREE.PlaneGeometry(2, 2);
+                const material = new THREE.ShaderMaterial({
+                    vertexShader,
+                    fragmentShader,
+                    uniforms: this.uniforms
+                });
+                
+                this.mesh = new THREE.Mesh(geometry, material);
+                this.scene.add(this.mesh);
+            }
+            
+            setupEvents() {
+                window.addEventListener('resize', () => this.onResize());
+                
+                // Mouse events
+                window.addEventListener('mousemove', (e) => this.onMouseMove(e));
+                window.addEventListener('mousedown', (e) => this.onInteraction(e.clientX, e.clientY, 1.0));
+                
+                // Touch events
+                window.addEventListener('touchstart', (e) => {
+                    e.preventDefault();
+                    for (let i = 0; i < e.touches.length; i++) {
+                        const touch = e.touches[i];
+                        this.onInteraction(touch.clientX, touch.clientY, 1.0);
+                    }
+                }, { passive: false });
+                
+                window.addEventListener('touchmove', (e) => {
+                    e.preventDefault();
+                    const touch = e.touches[0];
+                    this.onMouseMove({ clientX: touch.clientX, clientY: touch.clientY });
+                    // Add continuous touch points for drag distortion
+                    this.onInteraction(touch.clientX, touch.clientY, 0.5);
+                }, { passive: false });
+                
+                // Reduced motion preference
+                window.matchMedia('(prefers-reduced-motion: reduce)').addEventListener('change', (e) => {
+                    this.reducedMotion = e.matches;
+                    this.uniforms.uReducedMotion.value = this.reducedMotion;
+                });
+            }
+            
+            onResize() {
+                const width = window.innerWidth;
+                const height = window.innerHeight;
+                
+                this.renderer.setSize(width, height);
+                this.uniforms.uAspect.value = width / height;
+                this.uniforms.uResolution.value.set(width, height);
+            }
+            
+            onMouseMove(e) {
+                const x = e.clientX / window.innerWidth;
+                const y = 1.0 - e.clientY / window.innerHeight;
+                
+                this.prevMousePos.copy(this.mousePos);
+                this.mousePos.set(x, y);
+                
+                // Calculate velocity
+                this.mouseVelocity.set(
+                    this.mousePos.x - this.prevMousePos.x,
+                    this.mousePos.y - this.prevMousePos.y
+                );
+                
+                // Add global distortion based on movement
+                this.globalDistortion += this.mouseVelocity.length() * 2.0;
+                this.globalDistortion = Math.min(this.globalDistortion, 1.0);
+            }
+            
+            onInteraction(clientX, clientY, strength) {
+                const x = clientX / window.innerWidth;
+                const y = 1.0 - clientY / window.innerHeight;
+                
+                // Add touch point
+                this.touches.push({
+                    position: new THREE.Vector2(x, y),
+                    time: this.uniforms.uTime.value,
+                    strength: strength
+                });
+                
+                // Boost global distortion on interaction
+                this.globalDistortion += 0.3 * strength;
+                this.globalDistortion = Math.min(this.globalDistortion, 1.0);
+                
+                // Keep only recent touches
+                if (this.touches.length > this.maxTouches) {
+                    this.touches.shift();
+                }
+                
+                this.updateTouchUniforms();
+            }
+            
+            updateTouchUniforms() {
+                const positions = this.uniforms.uTouchPositions.value;
+                const times = this.uniforms.uTouchTimes.value;
+                const strengths = this.uniforms.uTouchStrengths.value;
+                
+                for (let i = 0; i < this.maxTouches; i++) {
+                    if (i < this.touches.length) {
+                        positions[i].copy(this.touches[i].position);
+                        times[i] = this.touches[i].time;
+                        strengths[i] = this.touches[i].strength;
+                    }
+                }
+                
+                this.uniforms.uTouchCount.value = this.touches.length;
+            }
+            
+            animate() {
+                requestAnimationFrame(() => this.animate());
+                
+                // Update time
+                this.uniforms.uTime.value += 0.016;
+                
+                // Smooth mouse tracking
+                this.uniforms.uMouse.value.lerp(this.mousePos, 0.1);
+                
+                // Smooth velocity decay
+                this.uniforms.uMouseVelocity.value.lerp(this.mouseVelocity, 0.15);
+                this.mouseVelocity.multiplyScalar(0.92);
+                
+                // Very slow decay for global distortion (long-lasting effect)
+                this.globalDistortion *= 0.995;
+                this.uniforms.uGlobalDistortion.value = this.globalDistortion;
+                
+                // Clean old touches (older than 15 seconds for longer effect)
+                const currentTime = this.uniforms.uTime.value;
+                this.touches = this.touches.filter(t => currentTime - t.time < 15.0);
+                this.updateTouchUniforms();
+                
+                // Render
+                this.renderer.render(this.scene, this.camera);
+            }
+        }
+        
+        // Initialize
+        new RadiantEnergy();
+    </script>
+</body>
+</html>
